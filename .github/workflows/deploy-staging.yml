@@ -1,0 +1,120 @@
+on:
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+name: Deploy staging
+
+concurrency: deploy-stage
+
+env:
+  ENVIRONMENT: stage
+  APPLICATION_NAME: test-terraform
+  DOMAIN: test-terraform.nayya.com
+  USE_BLUE_GREEN: true
+
+jobs:
+  aws-deployment:
+    name: Docker Build + Terraform Deploy
+    runs-on: self-hosted
+    outputs:
+      status: ${{ steps.set_status.outputs.status }}
+    env:
+      TF_INPUT: "0"
+
+    steps:
+      # Better Docker builds:
+      - uses: docker/setup-buildx-action@v1
+        with:
+          install: true
+          driver: docker
+          buildkitd-flags: --debug
+
+      # Needed for Terraform:
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '14'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.0.1
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Checkout
+        uses: actions/checkout@v2
+ 
+      - name: Build, Tag, and Push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO_NAME: ${{ env.APPLICATION_NAME }}-${{ env.ENVIRONMENT }}
+        run: ./deployments/scripts/docker.sh
+
+      - name: Terraform
+        working-directory: deployments/terraform
+        env:
+          TF_WORKSPACE: ${{ env.ENVIRONMENT }}
+          TF_VAR_environment: ${{ env.ENVIRONMENT }}
+          TF_VAR_domain: ${{ env.DOMAIN }}
+          TF_VAR_use_blue_green: ${{ env.USE_BLUE_GREEN }}
+          TF_VAR_app_name: ${{ env.APPLICATION_NAME }}
+          TF_VAR_image: ${{ steps.build-image.outputs.image }}
+          TF_VAR_cpu: 256 # Suggested for prod apps: 1024
+          TF_VAR_memory: 512 # Suggested for prod apps: 2048
+          TF_VAR_desired_capacity: 1 # Suggested for prod apps: 2
+          # For the example app:
+          TF_VAR_commit_hash: ${{ github.sha }}
+        run: |
+          terraform init
+          terraform validate -no-color
+          terraform plan -no-color
+          terraform apply -auto-approve
+
+      - name: Set status
+        id: set_status
+        run: echo "::set-output name=status::success"
+
+#      - name: Slack notification
+#        env:
+#          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+#          SLACK_USERNAME: GitHub Actions
+#          SLACK_CHANNEL: ${{ secrets.CI_SLACK_CHANNEL }}
+#          APPLICATION_NAME: ${{ env.APPLICATION_NAME }}
+#          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+#          REPO: ${{ github.repository }}
+#        uses: Ilshidur/action-slack@2.1.0
+#        with:
+#          args: "Successfully deployed `{{ APPLICATION_NAME }}` to `{{ ENVIRONMENT }}`\nCommit that triggered deployment: <https://github.com/{{ REPO }}/commit/{{ GITHUB_SHA }}|{{ GITHUB_SHA }}>\nGitHub Action run: <https://github.com/{{ GITHUB_REPOSITORY }}/actions/runs/{{ GITHUB_RUN_ID }}|{{ GITHUB_RUN_ID }}>"
+
+#  notify-failure:
+#    name: Notify failure
+#    runs-on: ubuntu-18.04
+#    needs:
+#      - aws-deployment
+#    if: "always() && needs.aws-deployment.outputs.status != 'success'"
+
+#    steps:
+#      - name: Slack notification
+#        env:
+#          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+#          SLACK_USERNAME: GitHub Actions
+#          SLACK_CHANNEL: ${{ secrets.CI_SLACK_CHANNEL }}
+#          APPLICATION_NAME: ${{ env.APPLICATION_NAME }}
+#          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+#          REPO: ${{ github.repository }}
+#        uses: Ilshidur/action-slack@2.1.0
+#        with:
+#          args: "Deployment of `{{ APPLICATION_NAME }}` to `{{ ENVIRONMENT }}` failed!\nCommit that triggered deployment: <https://github.com/{{ REPO }}/commit/{{ GITHUB_SHA }}|{{ GITHUB_SHA }}>\nGitHub Action run: <https://github.com/{{ GITHUB_REPOSITORY }}/actions/runs/{{ GITHUB_RUN_ID }}|{{ GITHUB_RUN_ID }}>"
